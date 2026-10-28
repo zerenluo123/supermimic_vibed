@@ -16,27 +16,21 @@ BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
 
 
 class MotionLib:
-    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0):
+    def __init__(self, files: list[str], kin: G1Kinematics, device: str, src_fps: float = 30.0, clips=None):
         self.device = device
-        self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
-        ps, qs, js = [], [], []
-        lens = []
-        for f in files:
-            raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
-            p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
-            quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
-            # resample to 50 Hz
-            T_src = raw.shape[0]
-            dur = (T_src - 1) / src_fps
-            n = int(np.floor(dur / CONTROL_DT)) + 1
-            t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
-            i0 = torch.clamp(t.floor().long(), max=T_src - 2)
-            a = (t - i0.float()).clamp(0, 1)
-            p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
-            j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
-            quat = quat_slerp(quat[i0], quat[i0 + 1], a)
-            ps.append(p), qs.append(quat), js.append(j)
-            lens.append(n)
+        if clips is None:
+            self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+            ps, qs, js = [], [], []
+            lens = []
+            for f in files:
+                raw = torch.tensor(np.loadtxt(f, delimiter=","), dtype=torch.float32)
+                p, q_xyzw, j = raw[:, :3], raw[:, 3:7], raw[:, 7:36]
+                quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
+                p, quat, j, n = _resample(p, quat, j, src_fps)
+                ps.append(p), qs.append(quat), js.append(j)
+                lens.append(n)
+        else:
+            self.names, ps, qs, js, lens = clips
         self.clip_len = torch.tensor(lens, device=device)
         self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), torch.tensor(lens[:-1], dtype=torch.long))), 0).to(device)  # dtype: one clip gives an empty (float) tensor
         self.clip_end = self.clip_start + self.clip_len - 1  # last valid frame (inclusive)
@@ -91,6 +85,31 @@ class MotionLib:
         files = sorted(glob.glob(os.path.join(path, "*.csv")))
         return MotionLib(files, kin, device)
 
+    @staticmethod
+    def from_g1d_dir(path: str, kin, device: str) -> MotionLib:
+        """Joblib clips: fps, root_pos, root_rot xyzw, dof_pos (two slides then 16 joints)."""
+        import joblib
+
+        files = sorted(glob.glob(os.path.join(path, "*.pkl")))
+        if not files:
+            raise FileNotFoundError(f"no pkl clips in {path}")
+        names, ps, qs, js, lens = [], [], [], [], []
+        for f in files:
+            raw = joblib.load(f)
+            p = torch.tensor(np.asarray(raw["root_pos"]), dtype=torch.float32)
+            q_xyzw = torch.tensor(np.asarray(raw["root_rot"]), dtype=torch.float32)
+            dof = np.asarray(raw["dof_pos"])
+            if dof.shape[-1] != 18:
+                raise ValueError(f"{f} dof_pos has {dof.shape[-1]} columns, expected 18")
+            height = dof[:, 0] + dof[:, 1]
+            j = torch.tensor(np.concatenate([height[:, None], dof[:, 2:]], axis=1), dtype=torch.float32)
+            quat = torch.cat((q_xyzw[:, 3:4], q_xyzw[:, :3]), -1)
+            p, quat, j, n = _resample(p, quat, j, float(raw["fps"]))
+            names.append(os.path.splitext(os.path.basename(f))[0])
+            ps.append(p), qs.append(quat), js.append(j)
+            lens.append(n)
+        return MotionLib([], kin, device, clips=(names, ps, qs, js, lens))
+
     def future_frames(self, f: torch.Tensor, K: int) -> torch.Tensor:
         """Frames f+1..f+K clamped to the clip's last frame, shape (B, K)."""
         end = self.clip_end[self.clip_id[f]]
@@ -111,6 +130,20 @@ class MotionLib:
 
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]
+
+
+def _resample(p, quat, j, src_fps: float):
+    """Linear resample of position and joints, slerp of quaternions, onto CONTROL_DT."""
+    T_src = p.shape[0]
+    dur = (T_src - 1) / src_fps
+    n = int(np.floor(dur / CONTROL_DT)) + 1
+    t = torch.arange(n, dtype=torch.float32) * CONTROL_DT * src_fps
+    i0 = torch.clamp(t.floor().long(), max=T_src - 2)
+    a = (t - i0.float()).clamp(0, 1)
+    p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
+    j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
+    quat = quat_slerp(quat[i0], quat[i0 + 1], a)
+    return p, quat, j, n
 
 
 def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:

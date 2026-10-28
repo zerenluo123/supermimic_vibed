@@ -38,6 +38,7 @@ parser.add_argument("--wm_only_iters", type=int, default=500, help="world-model-
 parser.add_argument("--lr_decay_iters", type=int, default=250_000)
 parser.add_argument("--ckpt_every", type=int, default=2000)
 parser.add_argument("--log_every", type=int, default=50)
+parser.add_argument("--robot", choices=("g1", "g1d"), default="g1")
 parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
@@ -52,7 +53,7 @@ import torch.nn as nn
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
+from supermimic.mdp import MDP
 from supermimic.motion import MotionLib
 import supermimic.networks as networks
 from supermimic.networks import Critic, Policy, WorldModel
@@ -66,15 +67,28 @@ dev = "cuda:0"
 os.makedirs(args.log_dir, exist_ok=True)
 json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
-kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(args.motion_dir, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
-K, Hh, HZ = args.goal_frames, args.hist, args.horizon
-GOAL_DIM = 73 * K
-CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
+if args.robot == "g1d":
+    if os.path.abspath(args.motion_dir) == os.path.join(REPO, "data", "lafan1_g1"):
+        raise SystemExit("g1d needs --motion_dir pointing at the v1 pkl directory")
+    from supermimic.g1d import COLUMN_LIMIT, COUPLED, STATE_JOINTS, TRACKED_BODIES
+    from supermimic.kinematics import G1DKinematics
+    from supermimic.robot import g1d_default_q
 
-wm = WorldModel().to(dev)
-pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
+    _xml = os.path.join(REPO, "data", "g1d_description", "g1d.xml")
+    kin = G1DKinematics(dev, _xml, STATE_JOINTS, TRACKED_BODIES, COUPLED, COLUMN_LIMIT)
+    motion = MotionLib.from_g1d_dir(args.motion_dir, kin, dev)
+    mdp = MDP(kin, motion, torch.tensor(g1d_default_q(), device=dev), obs_kind="g1d")
+else:
+    kin = G1Kinematics(dev)
+    motion = MotionLib.from_dir(args.motion_dir, kin, dev)
+    mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+K, Hh, HZ = args.goal_frames, args.hist, args.horizon
+GOAL_DIM = mdp.goal_frame * K
+CRITIC_IN = mdp.inv_dim + mdp.critic_extra + GOAL_DIM
+NUM_J = mdp.nj
+
+wm = WorldModel(num_j=mdp.nj, inv_dim=mdp.inv_dim, xi_dim=mdp.xi_dim, action_dim=mdp.action_dim).to(dev)
+pi = Policy(mdp.obs_dim, GOAL_DIM, hist=Hh, action_dim=mdp.action_dim).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
 opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
 opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
@@ -89,21 +103,21 @@ if args.resume:
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
 ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                       torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
+                       torch.full((NUM_J,), 3e-3), torch.full((NUM_J,), 5e-2))).to(dev)  # fmt: skip
 
 
 def _wm_rollout(s, a, xi):
-    S = unflatten_state(s[:, 0])
+    S = mdp.unflatten(s[:, 0])
     preds = []
     for j in range(args.wm_window):
-        S = wm.step(S, a[:, j], normalize_xi(xi[:, j]))
+        S = wm.step(S, a[:, j], mdp.normalize_xi(xi[:, j]))
         preds.append(S)
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
 
 def _wm_err(S_hat, s1, mask):
     std = torch.maximum(wm.out_norm.std(), ERR_FLOOR)
-    e = (wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2  # (B, k, D)
+    e = (wm.state_error(S_hat, mdp.unflatten(s1)) / std) ** 2  # (B, k, D)
     e = e.mean(-1)
     return (e * mask).sum() / s1.shape[0], e[:, -1]
 
@@ -176,11 +190,11 @@ def policy_update():
     if PROFILE:
         torch.cuda.synchronize(); tq0 = time.time()
     s, h = sample_valid_starts(args.pi_batch)
-    S = unflatten_state(s["s"])
+    S = mdp.unflatten(s["s"])
     xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
-    xi_n = normalize_xi(xi)
+    xi_n = mdp.normalize_xi(xi)
     with torch.no_grad():
-        o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
+        o_hist = mdp.obs(mdp.unflatten(h["s"]), h["a_prev"], h["xi"], h["f"])
     o_hist = mdp.add_noise(o_hist)
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
@@ -259,9 +273,9 @@ def policy_update():
 # ------------------------------------------------------------------------------------------------
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
-    env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma)
-    buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
-    obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
+    env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma, kind=args.robot)
+    buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, mdp.state_dim, mdp.action_dim, mdp.xi_dim)
+    obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 
     @torch.no_grad()
     def collect(n_steps: int, stats: dict):
@@ -278,8 +292,8 @@ with launch_simulation(sim_cfg, args):
             a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
             out = env.step(a)
             buffer.add(out)
-            S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
-            wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
+            S0, S1 = mdp.unflatten(out["s"]), mdp.unflatten(out["s1"])
+            wm.in_norm.update(wm.inputs(S0, out["a"], mdp.normalize_xi(out["xi"])))
             wm.out_norm.update(wm.targets(S0, S1))
             sim_steps += args.num_envs
             stats["r"].append(out["r"].mean() / 0.1)

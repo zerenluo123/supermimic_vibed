@@ -67,14 +67,17 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 class WorldModel(nn.Module):
     """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments."""
 
-    def __init__(self, hidden=(2048, 2048, 2048)):
+    def __init__(self, hidden=(2048, 2048, 2048), num_j: int = NUM_J, inv_dim: int = INV_DIM, xi_dim: int = XI_DIM, action_dim: int | None = None):
         super().__init__()
-        self.in_dim = INV_DIM + NUM_J + XI_DIM
-        self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
+        self.num_j = num_j
+        action_dim = num_j if action_dim is None else action_dim
+        self.in_dim = inv_dim + action_dim + xi_dim
+        self.out_dim = 12 + 2 * num_j
+        self.net = mlp(self.in_dim, list(hidden), self.out_dim, act=nn.SiLU, layer_norm=True)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.in_dim)
-        self.out_norm = RunningNorm(WM_OUT, eps=1e-4)
+        self.out_norm = RunningNorm(self.out_dim, eps=1e-4)
 
     def inputs(self, S, a, xi_n):
         return torch.cat((invariant_features(S), a, xi_n), -1)
@@ -105,7 +108,7 @@ class WorldModel(nn.Module):
         y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n)))
         d = y * self.out_norm.std() + self.out_norm.mean
         H = yaw_mat(R)
-        dp, dth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)
+        dp, dth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, self.num_j, self.num_j), -1)
         p1 = p + (H @ dp.unsqueeze(-1)).squeeze(-1)
         R1 = R @ so3_exp(dth)
         v1 = v + (R @ dv.unsqueeze(-1)).squeeze(-1)
@@ -137,11 +140,11 @@ class WorldModel(nn.Module):
 class Policy(nn.Module):
     """a = dec(enc(g), o_{t-9:t}); deterministic, latent z in R^32 bounded by tanh."""
 
-    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32):
+    def __init__(self, obs_dim: int, goal_dim: int, hist: int = 10, z_dim: int = 32, action_dim: int = NUM_J):
         super().__init__()
         self.hist = hist
         self.enc = mlp(goal_dim, [2048, 1024, 512, 256], z_dim)
-        self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], NUM_J)
+        self.dec = mlp(z_dim + obs_dim * hist, [2048, 1024, 512, 256], action_dim)
         with torch.no_grad():
             self.dec[-1].weight.mul_(0.01)
             self.dec[-1].bias.zero_()

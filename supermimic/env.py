@@ -8,6 +8,7 @@ reference-motion states drawn by return-based bin sampling (paper Appendix D.1).
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import warp as wp
@@ -47,13 +48,20 @@ class TrackingSim:
     """
 
     def __init__(self, sim_cfg, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
-                 max_episode_steps: int = 500, reset_noise: bool = True):
+                 max_episode_steps: int = 500, reset_noise: bool = True, kind: str = "g1"):
         self.device = sim_cfg.device
+        self.kind = kind
         self.sim = SimulationContext(sim_cfg)
-        self.scene = instantiate(TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True))
+        scene_cfg = TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True)
+        if kind == "g1d":
+            from .robot import g1d_articulation_cfg
+
+            scene_cfg = replace(scene_cfg, robot=g1d_articulation_cfg())
+        self.scene = instantiate(scene_cfg)
         self.sim.reset()
         self.robot = self.scene["robot"]
-        assert list(self.robot.joint_names) == G1_JOINT_NAMES, self.robot.joint_names
+        if kind == "g1":
+            assert list(self.robot.joint_names) == G1_JOINT_NAMES, self.robot.joint_names
         self.N = num_envs
         self.motion, self.mdp, self.gamma = motion, mdp, gamma
         self.eval_mode = eval_mode
@@ -61,11 +69,18 @@ class TrackingSim:
         self.reset_noise = reset_noise and not eval_mode
         dev = self.device
         self.default_q = self.robot.data.default_joint_pos.torch[0].clone()
-        self.alpha = torch.tensor([action_scale(n) for n in G1_JOINT_NAMES], device=dev)
+        if kind == "g1":
+            self.alpha = torch.tensor([action_scale(n) for n in G1_JOINT_NAMES], device=dev)
+        else:
+            from .robot import g1d_action_scale
+
+            self.alpha = torch.tensor(g1d_action_scale(), device=dev)
+            self._bind_g1d()
         self.torso_id = self.robot.find_bodies("torso_link")[0][0]
 
-        # ---- sim context xi = [friction, joint offsets(29), torso com offset(3)] ----
-        self.xi = torch.zeros(self.N, 33, device=dev)
+        # ---- sim context xi = [friction, joint offsets, torso com offset(3)] ----
+        nj = self.mdp.nj
+        self.xi = torch.zeros(self.N, self.mdp.xi_dim, device=dev)
         self._setup_friction()
         if eval_mode:
             self.xi[:, 0] = 1.0
@@ -79,15 +94,17 @@ class TrackingSim:
                 ),
                 -1,
             )
-            self.xi[:, 30:33] = com
+            self.xi[:, 1 + nj : 1 + nj + 3] = com
             default_com = self.robot.data.body_com_pose_b.torch[:, self.torso_id, :3].clone()
             self.robot.set_coms_index(coms=(default_com + com).unsqueeze(1), body_ids=[self.torso_id])
         self._apply_friction()
+        if kind == "g1d":
+            self._prepare_g1d_drives()
 
         # ---- episode bookkeeping ----
         self.f = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_step = torch.zeros(self.N, dtype=torch.long, device=dev)
-        self.a_prev = torch.zeros(self.N, 29, device=dev)
+        self.a_prev = torch.zeros(self.N, self.mdp.action_dim, device=dev)
         self.start_bin = torch.zeros(self.N, dtype=torch.long, device=dev)
         self.ep_disc_ret = torch.zeros(self.N, device=dev)
         self.ep_ret = torch.zeros(self.N, device=dev)
@@ -97,6 +114,144 @@ class TrackingSim:
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.reset(torch.arange(self.N, device=dev))
+
+    # ------------------------------------------------------------------ g1d plant
+    def _bind_g1d(self):
+        from .g1d import BASE_JOINTS, LIFT_JOINTS, UPPER_JOINTS
+
+        names = list(self.robot.joint_names)
+
+        def j(name: str) -> int:
+            if name not in names:
+                raise RuntimeError(f"USD is missing joint {name}; have {names}")
+            return names.index(name)
+
+        self.base_ids = [j(n) for n in BASE_JOINTS]
+        self.lift_ids = [j(n) for n in LIFT_JOINTS]
+        self.upper_ids = [j(n) for n in UPPER_JOINTS]
+        self.agv_id = int(self.robot.find_bodies("AGV_link")[0][0])
+
+    def _prepare_g1d_drives(self):
+        """Velocity-drive gains from the chassis test: kv = m/τ, lift split, yaw measured once."""
+        import math
+
+        import mujoco
+
+        from .g1d import TAU
+
+        mj = mujoco.MjModel.from_xml_path(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "g1d_description", "g1d.xml"))
+        mass = float(mj.body_mass.sum())
+
+        def subtree(body_name: str) -> float:
+            root = mujoco.mj_name2id(mj, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            ids = [root]
+            changed = True
+            while changed:
+                changed = False
+                for i in range(mj.nbody):
+                    if int(mj.body_parentid[i]) in ids and i not in ids:
+                        ids.append(i)
+                        changed = True
+            return float(mj.body_mass[ids].sum())
+
+        m_mt, m_it = subtree("LZ_mt_Link"), subtree("LZ_it_Link")
+        dev = self.device
+        n = self.robot.num_joints
+        self.ff = torch.zeros(self.N, n, device=dev)
+        g = 9.81
+        self.ff[:, self.lift_ids[0]] = m_mt * g
+        self.ff[:, self.lift_ids[1]] = m_it * g
+        self.robot.write_joint_damping_to_sim_index(
+            damping=torch.full((self.N, 1), mass / TAU, device=dev), joint_ids=[self.base_ids[0]]
+        )
+        self.robot.write_joint_damping_to_sim_index(
+            damping=torch.full((self.N, 1), mass / TAU, device=dev), joint_ids=[self.base_ids[1]]
+        )
+        m_stage = (m_mt - m_it) + 4.0 * m_it
+        kv = 0.5 * m_stage / TAU
+        for i in self.lift_ids:
+            self.robot.write_joint_damping_to_sim_index(damping=torch.full((self.N, 1), kv, device=dev), joint_ids=[i])
+        iyaw = self.base_ids[2]
+        kd0 = 8.0
+        self.robot.write_joint_damping_to_sim_index(damping=torch.full((self.N, 1), kd0, device=dev), joint_ids=[iyaw])
+        hold = torch.zeros(self.N, n, device=dev)
+        self.robot.write_joint_position_to_sim_index(position=hold)
+        self.robot.write_joint_velocity_to_sim_index(velocity=torch.zeros_like(hold))
+        self.scene.write_data_to_sim()
+        self.sim.forward()
+        self.scene.update(0.0)
+        probe, duration = 0.25, 0.2
+        vel = torch.zeros(self.N, n, device=dev)
+        vel[:, iyaw] = probe
+        cmd = self.robot.actuators.target_command
+        for _ in range(int(round(duration / CONTROL_DT))):
+            cmd.set_position_index(value=hold, full_data=True)
+            cmd.set_velocity_index(value=vel, full_data=True)
+            cmd.set_effort_index(value=self.ff, full_data=True)
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.scene.update(CONTROL_DT)
+        wz = float(self.robot.data.joint_vel.torch[0, iyaw])
+        frac = min(max(wz / probe, 1e-4), 0.999)
+        tau_yaw = -duration / math.log(1.0 - frac)
+        self.robot.write_joint_damping_to_sim_index(
+            damping=torch.full((self.N, 1), kd0 * tau_yaw / TAU, device=dev), joint_ids=[iyaw]
+        )
+
+    def _yaw(self, R: torch.Tensor) -> torch.Tensor:
+        return torch.atan2(R[..., 1, 0], R[..., 0, 0])
+
+    def _write_g1d(self, env_ids, p, R, v, w, q, qd):
+        n = len(env_ids)
+        nj = self.robot.num_joints
+        dev = self.device
+        pose = torch.zeros(n, 7, device=dev)
+        pose[:, :2] = self.scene.env_origins[env_ids, :2]
+        pose[:, 2] = p[:, 2] + self.scene.env_origins[env_ids, 2]
+        pose[:, 6] = 1.0
+        self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
+        self.robot.write_root_link_velocity_to_sim_index(root_velocity=torch.zeros(n, 6, device=dev), env_ids=env_ids)
+        pos = torch.zeros(n, nj, device=dev)
+        vel = torch.zeros(n, nj, device=dev)
+        yaw = self._yaw(R)
+        pos[:, self.base_ids[0]] = p[:, 0]
+        pos[:, self.base_ids[1]] = p[:, 1]
+        pos[:, self.base_ids[2]] = yaw
+        pos[:, self.lift_ids] = (0.5 * q[:, :1])
+        pos[:, self.upper_ids] = q[:, 1:]
+        vel[:, self.base_ids[0]] = v[:, 0]
+        vel[:, self.base_ids[1]] = v[:, 1]
+        vel[:, self.base_ids[2]] = w[:, 2]
+        vel[:, self.lift_ids] = (0.5 * qd[:, :1])
+        vel[:, self.upper_ids] = qd[:, 1:]
+        self.robot.write_joint_position_to_sim_index(position=pos, env_ids=env_ids)
+        self.robot.write_joint_velocity_to_sim_index(velocity=vel, env_ids=env_ids)
+        hold = pos.clone()
+        cmd = self.robot.actuators.target_command
+        cmd.set_position_index(value=hold, env_ids=env_ids)
+        cmd.set_velocity_index(value=vel, env_ids=env_ids)
+
+    def _command_g1d(self, a: torch.Tensor, xi: torch.Tensor):
+        S = self.state()
+        R = S[1]
+        yaw = self._yaw(R)
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        vx = self.alpha[16] * a[:, 16]
+        wz = self.alpha[17] * a[:, 17]
+        vz = self.alpha[18] * a[:, 18]
+        q = self.robot.data.joint_pos.torch
+        vel = torch.zeros_like(q)
+        hold = q.clone()
+        bias = xi[:, 2 : 2 + 16]
+        hold[:, self.upper_ids] = self.mdp.default_q[1:] + bias + self.alpha[:16] * a[:, :16]
+        vel[:, self.base_ids[0]] = vx * c
+        vel[:, self.base_ids[1]] = vx * s
+        vel[:, self.base_ids[2]] = wz
+        vel[:, self.lift_ids] = (0.5 * vz).unsqueeze(-1)
+        cmd = self.robot.actuators.target_command
+        cmd.set_position_index(value=hold, full_data=True)
+        cmd.set_velocity_index(value=vel, full_data=True)
+        cmd.set_effort_index(value=self.ff, full_data=True)
 
     # ------------------------------------------------------------------ friction
     def _setup_friction(self):
@@ -115,12 +270,23 @@ class TrackingSim:
     # ------------------------------------------------------------------ state
     def state(self):
         d = self.robot.data
-        pose = d.root_link_pose_w.torch.clone()
-        vel = d.root_link_vel_w.torch.clone()
+        if self.kind == "g1d":
+            pose = d.body_link_pose_w.torch[:, self.agv_id]
+            vel = d.body_link_vel_w.torch[:, self.agv_id]
+        else:
+            pose = d.root_link_pose_w.torch
+            vel = d.root_link_vel_w.torch
         p = pose[:, :3] - self.scene.env_origins
         quat = pose[:, 3:7]  # Isaac Lab 3 uses xyzw
         R = quat_to_mat(torch.cat((quat[:, 3:4], quat[:, :3]), -1))
-        return (p, R, vel[:, :3], vel[:, 3:6], d.joint_pos.torch.clone(), d.joint_vel.torch.clone())
+        q = d.joint_pos.torch.clone()
+        qd = d.joint_vel.torch.clone()
+        if self.kind == "g1d":
+            height = q[:, self.lift_ids].sum(-1, keepdim=True)
+            speed = qd[:, self.lift_ids].sum(-1, keepdim=True)
+            q = torch.cat((height, q[:, self.upper_ids]), -1)
+            qd = torch.cat((speed, qd[:, self.upper_ids]), -1)
+        return (p, R, vel[:, :3], vel[:, 3:6], q, qd)
 
     # ------------------------------------------------------------------ reset
     def sample_frames(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -145,7 +311,22 @@ class TrackingSim:
             bins = self.motion.frame_bin[frames]
         m = self.motion
         p, R, v, w, q, qd = (x.clone() for x in m.ref_state(frames))
-        if self.reset_noise:
+        if self.reset_noise and self.kind == "g1d":
+            p = p + torch.stack(
+                (torch.empty(n, device=dev).uniform_(-0.05, 0.05), torch.empty(n, device=dev).uniform_(-0.05, 0.05),
+                 torch.zeros(n, device=dev)), -1)  # fmt: skip
+            rv = torch.stack(
+                (torch.zeros(n, device=dev), torch.zeros(n, device=dev), torch.empty(n, device=dev).uniform_(-0.2, 0.2)), -1
+            )
+            R = so3_exp(rv) @ R
+            v = v + torch.stack(
+                (torch.empty(n, device=dev).uniform_(-0.5, 0.5), torch.empty(n, device=dev).uniform_(-0.5, 0.5),
+                 torch.zeros(n, device=dev)), -1)  # fmt: skip
+            w = w + torch.stack(
+                (torch.zeros(n, device=dev), torch.zeros(n, device=dev), torch.empty(n, device=dev).uniform_(-0.78, 0.78)), -1
+            )
+            q = q + torch.empty_like(q).uniform_(-0.1, 0.1)
+        elif self.reset_noise:
             p = p + torch.stack(
                 (torch.empty(n, device=dev).uniform_(-0.05, 0.05), torch.empty(n, device=dev).uniform_(-0.05, 0.05),
                  torch.empty(n, device=dev).uniform_(-0.01, 0.01)), -1)  # fmt: skip
@@ -161,13 +342,16 @@ class TrackingSim:
                  torch.empty(n, device=dev).uniform_(-0.78, 0.78)), -1)  # fmt: skip
             q = q + torch.empty_like(q).uniform_(-0.1, 0.1)
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
-        quat = mat_to_quat(R)
-        pose = torch.cat((p + self.scene.env_origins[env_ids], quat[:, 1:4], quat[:, 0:1]), -1)
-        self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
-        self.robot.write_root_link_velocity_to_sim_index(root_velocity=torch.cat((v, w), -1), env_ids=env_ids)
-        self.robot.write_joint_position_to_sim_index(position=q, env_ids=env_ids)
-        self.robot.write_joint_velocity_to_sim_index(velocity=qd, env_ids=env_ids)
-        self.robot.set_joint_position_target_index(target=q, env_ids=env_ids)
+        if self.kind == "g1d":
+            self._write_g1d(env_ids, p, R, v, w, q, qd)
+        else:
+            quat = mat_to_quat(R)
+            pose = torch.cat((p + self.scene.env_origins[env_ids], quat[:, 1:4], quat[:, 0:1]), -1)
+            self.robot.write_root_link_pose_to_sim_index(root_pose=pose, env_ids=env_ids)
+            self.robot.write_root_link_velocity_to_sim_index(root_velocity=torch.cat((v, w), -1), env_ids=env_ids)
+            self.robot.write_joint_position_to_sim_index(position=q, env_ids=env_ids)
+            self.robot.write_joint_velocity_to_sim_index(velocity=qd, env_ids=env_ids)
+            self.robot.set_joint_position_target_index(target=q, env_ids=env_ids)
         self.f[env_ids] = frames
         self.ep_step[env_ids] = 0
         self.a_prev[env_ids] = 0.0
@@ -175,7 +359,8 @@ class TrackingSim:
         self.ep_disc_ret[env_ids] = 0.0
         self.ep_ret[env_ids] = 0.0
         if not self.eval_mode:
-            self.xi[env_ids, 1:30] = torch.empty(n, 29, device=dev).uniform_(-0.01, 0.01)
+            nj = self.mdp.nj
+            self.xi[env_ids, 1 : 1 + nj] = torch.empty(n, nj, device=dev).uniform_(-0.01, 0.01)
         self.scene.reset(env_ids)
 
     def refresh(self):
@@ -190,8 +375,11 @@ class TrackingSim:
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
-        target = self.default_q + xi[:, 1:30] + self.alpha * a
-        self.robot.set_joint_position_target_index(target=target)
+        if self.kind == "g1d":
+            self._command_g1d(a, xi)
+        else:
+            target = self.default_q + xi[:, 1:30] + self.alpha * a
+            self.robot.set_joint_position_target_index(target=target)
         self.scene.write_data_to_sim()
         self.sim.step(render=False)
         self.scene.update(CONTROL_DT)

@@ -25,7 +25,8 @@ parser.add_argument("--run_dir", type=str, required=True)
 parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
-parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
+parser.add_argument("--robot", choices=("g1", "g1d"), default=None)
+parser.add_argument("--motion_dir", type=str, default=None)
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 add_launcher_args(parser)
 args = parser.parse_args()
@@ -36,16 +37,33 @@ import torch
 import supermimic.networks as networks
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
+from supermimic.mdp import MAX_STEP_REWARD, MDP
 from supermimic.motion import MotionLib
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
 
 torch.backends.cuda.matmul.allow_tf32 = True
 dev = "cuda:0"
-kin = G1Kinematics(dev)
-motion = MotionLib.from_dir(args.motion_dir, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
+_meta = {}
+_args_path = os.path.join(args.run_dir, "args.json")
+if os.path.exists(_args_path):
+    _meta = json.load(open(_args_path))
+if args.robot is None:
+    args.robot = _meta.get("robot", "g1")
+if args.motion_dir is None:
+    args.motion_dir = _meta.get("motion_dir", os.path.join(REPO, "data", "lafan1_g1"))
+if args.robot == "g1d":
+    from supermimic.g1d import COLUMN_LIMIT, COUPLED, STATE_JOINTS, TRACKED_BODIES
+    from supermimic.kinematics import G1DKinematics
+    from supermimic.robot import g1d_default_q
+
+    kin = G1DKinematics(dev, os.path.join(REPO, "data", "g1d_description", "g1d.xml"), STATE_JOINTS, TRACKED_BODIES, COUPLED, COLUMN_LIMIT)
+    motion = MotionLib.from_g1d_dir(args.motion_dir, kin, dev)
+    mdp = MDP(kin, motion, torch.tensor(g1d_default_q(), device=dev), obs_kind="g1d")
+else:
+    kin = G1Kinematics(dev)
+    motion = MotionLib.from_dir(args.motion_dir, kin, dev)
+    mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
 C = len(motion.names)
 
 
@@ -54,7 +72,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
+    pi = Policy(mdp.obs_dim, mdp.goal_frame * K, hist=Hh, action_dim=mdp.action_dim).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
     ids = torch.arange(C, device=dev)
@@ -98,7 +116,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
-    env = TrackingSim(sim_cfg, C, motion, mdp, eval_mode=True)
+    env = TrackingSim(sim_cfg, C, motion, mdp, eval_mode=True, kind=args.robot)
     if args.ckpt:
         ck = torch.load(args.ckpt, map_location=dev)
         res = evaluate(env, ck, args.record)

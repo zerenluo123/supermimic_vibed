@@ -83,24 +83,56 @@ INV_DIM = 1 + 6 + 3 + 3 + 29 + 29
 
 
 class MDP:
-    def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg()):
+    def __init__(self, kin: G1Kinematics, motion: MotionLib, default_q: torch.Tensor, cfg: RewardCfg = RewardCfg(), obs_kind: str = "g1"):
         self.kin, self.motion, self.cfg = kin, motion, cfg
         self.default_q = default_q
+        self.obs_kind = obs_kind
+        self.nj = int(default_q.shape[-1])
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
         self.soft_lo, self.soft_hi = mid - half * cfg.soft_limit_factor, mid + half * cfg.soft_limit_factor
         dev = default_q.device
-        self.obs_noise = OBS_NOISE.to(dev)
-        self.obs_scale = OBS_SCALE.to(dev)
+        n_body = len(kin.tracked_idx)
+        self.xi_dim = 1 + self.nj + 3
+        self.inv_dim = 1 + 6 + 3 + 3 + 2 * self.nj
+        self.state_dim = 13 + 2 * self.nj
+        self.goal_frame = 15 + 2 * self.nj
+        self.n_tracked = n_body
+        self.critic_extra = self.nj + n_body * 3 + 3 + 6 + self.xi_dim
+        if obs_kind == "g1":
+            self.action_dim = self.nj
+            self.obs_dim = 3 * self.nj + 12
+            self.obs_noise = OBS_NOISE.to(dev)
+            self.obs_scale = OBS_SCALE.to(dev)
+        else:
+            from .g1d import OBS_NOISE_WIDTHS, OBS_SCALES
+
+            self.action_dim = 19
+            self.obs_dim = 59
+            self.obs_noise = torch.tensor(OBS_NOISE_WIDTHS, dtype=torch.float32, device=dev)
+            self.obs_scale = torch.tensor(OBS_SCALES, dtype=torch.float32, device=dev)
+
+    def unflatten(self, x: torch.Tensor):
+        nj = self.nj
+        return x[..., 0:3], quat_to_mat(x[..., 3:7]), x[..., 7:10], x[..., 10:13], x[..., 13 : 13 + nj], x[..., 13 + nj : 13 + 2 * nj]
+
+    def normalize_xi(self, xi: torch.Tensor) -> torch.Tensor:
+        nj = self.nj
+        return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., 1 : 1 + nj] / 0.01, xi[..., 1 + nj :] / 0.05), -1)
 
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
         """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
         p, R, v, w, q, qd = S
         Rt = R.transpose(-1, -2)
-        dq0 = xi[..., 1:30]
+        w_b = (Rt @ w.unsqueeze(-1)).squeeze(-1)
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
+        if self.obs_kind == "g1d":
+            bias = xi[..., 1 : 1 + self.nj]
+            upper = q[..., 1:] - self.default_q[1:] - bias[..., 1:]
+            return torch.cat((upper, qd[..., 1:], q[..., :1] - bias[..., :1], qd[..., :1], w_b, g_b, a_prev), -1)
+        dq0 = xi[..., 1:30]
         rel = mat_to_6d(Rt @ self.motion.root_R[f])
-        return torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev, rel), -1)
+        return torch.cat((q - self.default_q - dq0, qd, w_b, g_b, a_prev, rel), -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
