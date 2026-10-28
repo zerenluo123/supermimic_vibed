@@ -271,11 +271,11 @@ class TrackingSim:
     def state(self):
         d = self.robot.data
         if self.kind == "g1d":
-            pose = d.body_link_pose_w.torch[:, self.agv_id]
-            vel = d.body_link_vel_w.torch[:, self.agv_id]
+            pose = d.body_link_pose_w.torch[:, self.agv_id].clone()
+            vel = d.body_link_vel_w.torch[:, self.agv_id].clone()
         else:
-            pose = d.root_link_pose_w.torch
-            vel = d.root_link_vel_w.torch
+            pose = d.root_link_pose_w.torch.clone()
+            vel = d.root_link_vel_w.torch.clone()
         p = pose[:, :3] - self.scene.env_origins
         quat = pose[:, 3:7]  # Isaac Lab 3 uses xyzw
         R = quat_to_mat(torch.cat((quat[:, 3:4], quat[:, :3]), -1))
