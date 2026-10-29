@@ -23,13 +23,18 @@ from isaaclab.utils import configclass, instantiate, replace
 
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
-from .robot import G1_CFG, G1_JOINT_NAMES, action_scale
+from .reset_sampling import update_bin_returns
+from .robot import DATA_DIR, G1_CFG, G1_JOINT_NAMES, action_scale
 from .rotations import mat_to_quat, quat_to_mat, so3_exp
 
 
 @configclass
 class TrackingSceneCfg(InteractiveSceneCfg):
-    ground = AssetBaseCfg(prim_path="/World/ground", spawn=sim_utils.GroundPlaneCfg())
+    # Use the official asset cached by download_data.sh, avoiding OmniClient's S3 download at startup.
+    ground = AssetBaseCfg(
+        prim_path="/World/ground",
+        spawn=sim_utils.GroundPlaneCfg(usd_path=f"{DATA_DIR}/ground/default_ground_plane.usda"),
+    )
     robot = replace(G1_CFG, prim_path="{ENV_REGEX_NS}/Robot")
 
 
@@ -411,7 +416,7 @@ class TrackingSim:
             boot = torch.where(term[ids], 0.0, (self.gamma**T) * (self.ep_ret[ids] / T) / (1 - self.gamma))
             G = self.ep_disc_ret[ids] + boot
             b = self.start_bin[ids]
-            self.bin_G.index_put_((b,), 0.8 * self.bin_G[b] + 0.2 * G)
+            update_bin_returns(self.bin_G, b, G)
             out["ep_len"] = T
             out["ep_ret_norm"] = self.ep_ret[ids] / (T * MAX_STEP_REWARD)
             self.reset(ids)

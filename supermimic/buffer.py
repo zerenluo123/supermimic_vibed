@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .mdp import STATE_DIM, XI_DIM
+from .dimensions import STATE_DIM, XI_DIM
 
 FIELDS = {
     "s": (STATE_DIM, torch.float32),
@@ -47,6 +47,8 @@ class ReplayBuffer:
 
     def sample_windows(self, B: int, k: int):
         """k-step windows; returns dict of (B, k, ...) tensors and a validity mask (B, k)."""
+        if k < 1 or k > self.size:
+            raise ValueError(f"Cannot sample {k}-step windows from {self.size} buffered steps")
         t0 = torch.randint(0, self.size - k + 1, (B,), device=self.device)
         env = torch.randint(0, self.N, (B,), device=self.device)
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)

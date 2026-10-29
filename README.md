@@ -87,6 +87,10 @@ With the container from step 1 running:
 tools/download_data.sh
 ```
 
+This also caches Isaac Lab's official ground plane and textures in `data/ground/`.
+For existing datasets, run `bash tools/download_ground.sh` once. This avoids a startup
+stall in OmniClient's S3 download. No Docker rebuild is needed.
+
 It downloads both, then converts the robot inside the container:
 `tools/urdf_to_mjcf.py` compiles the URDF into `data/g1_description/g1_29dof.xml` (free-floating
 pelvis), and `tools/mjcf_to_usd.py` converts that MJCF to `data/g1_usd/g1_29dof/g1_29dof.usda`,

@@ -10,13 +10,12 @@ from dataclasses import dataclass
 
 import torch
 
+from .dimensions import STATE_DIM, XI_DIM
 from .kinematics import G1Kinematics
 from .motion import CONTROL_DT, MotionLib
 from .rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
 
-STATE_DIM = 71
 OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
-XI_DIM = 33
 NUM_J = 29
 
 # Table A.1 sensor noise (uniform half-widths), plus the reference-relative orientation

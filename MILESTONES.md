@@ -14,7 +14,7 @@ Times are local time (CEST, UTC+2) unless marked UTC. One GPU (RTX PRO 6000 Blac
 | 2026-10-21 18:11 | First checkpoint (it 2000, 0.15 h train time): eval normalized return 0.541, 12/40 clips failed. Eval watcher started (tmux 'eval_main') |
 | 2026-10-21 18:19 | it 4000 (0.41 h train time): eval normalized return 0.685, 4/40 failed |
 | 2026-10-21 18:32 | it 6000 (0.62 h train time): eval normalized return 0.781, 1/40 failed |
-| 2026-10-21 18:47 | it 8000 (0.82 h train time): eval normalized return 0.779, 2/40 failed. Failure analysis of fallAndGetUp1_subject5 (it 6000): genuine tracking failure in a get-up (robot rolls over), paper tilt termination fires correctly |
+| 2026-10-21 18:47 | it 8000 (0.82 h train time): eval normalized return 0.779, 2/40 failed. Failure analysis of fallAndGetUp1_subject5 (it 6000): genuine tracking failure in a get-up (robot rolls over); the paper tilt termination fires correctly |
 | 2026-10-21 18:39 | Success criterion set: eval return >= 0.82 AND 40/40 clips without termination |
 | 2026-10-21 18:57 | it 10000 (1.04 h train time): eval normalized return 0.811, 1/40 failed (fallAndGetUp2_subject3) |
 | 2026-10-21 19:10 | **RETURN TARGET REACHED**: it 12000 (1.24 h train time, ckpt saved 2026-10-21 17:05:52 UTC): eval normalized return 0.824 >= 0.82 (paper: 0.82 at 1.2 h on H100); 1/40 failed (jumps1_subject2) |

@@ -304,8 +304,8 @@ with launch_simulation(sim_cfg, args):
                 stats["done"].append(out["done"].float().sum())
 
     stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
-    if start_it == 0:
-        collect(args.warmup_steps, stats)
+    if buffer.size < args.wm_window:
+        collect(max(args.warmup_steps, args.wm_window), stats)
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
     if start_it == 0:
         log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
