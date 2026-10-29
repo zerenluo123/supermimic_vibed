@@ -241,6 +241,15 @@ class TrackingSim:
         cmd.set_position_index(value=hold, env_ids=env_ids)
         cmd.set_velocity_index(value=vel, env_ids=env_ids)
 
+    def _hold_action_g1d(self, env_ids, R, v, w, q, qd):
+        """Action whose targets are the reset state: upper joints at q, chassis and column at their reset speeds."""
+        bias = self.xi[env_ids, 2 : 2 + 16]
+        upper = (q[:, 1:] - self.mdp.default_q[1:] - bias) / self.alpha[:16]
+        yaw = self._yaw(R)
+        forward = v[:, 0] * torch.cos(yaw) + v[:, 1] * torch.sin(yaw)
+        base = torch.stack((forward, w[:, 2], qd[:, 0]), -1) / self.alpha[16:19]
+        return torch.cat((upper, base.clamp(-1.0, 1.0)), -1)
+
     def _command_g1d(self, a: torch.Tensor, xi: torch.Tensor):
         S = self.state()
         R = S[1]
@@ -356,7 +365,6 @@ class TrackingSim:
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         if self.kind == "g1d":
             self._write_g1d(env_ids, p, R, v, w, q, qd)
-            self.base_queue[:, env_ids] = 0.0
         else:
             quat = mat_to_quat(R)
             pose = torch.cat((p + self.scene.env_origins[env_ids], quat[:, 1:4], quat[:, 0:1]), -1)
@@ -374,6 +382,12 @@ class TrackingSim:
         if not self.eval_mode:
             nj = self.mdp.nj
             self.xi[env_ids, 1 : 1 + nj] = torch.empty(n, nj, device=dev).uniform_(-0.01, 0.01)
+        if self.kind == "g1d":
+            # The previous action is the one that holds the reset state, so the first step's action-rate
+            # penalty and a_prev in the observation see a real change of command, not a jump from 0.
+            hold = self._hold_action_g1d(env_ids, R, v, w, q, qd)
+            self.a_prev[env_ids] = hold
+            self.base_queue[:, env_ids] = (self.alpha[16:19] * hold[:, 16:19]).unsqueeze(0)
         self.scene.reset(env_ids)
 
     def refresh(self):
