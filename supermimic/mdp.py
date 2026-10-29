@@ -106,7 +106,7 @@ class MDP:
             from .g1d import OBS_NOISE_WIDTHS, OBS_SCALES
 
             self.action_dim = 19
-            self.obs_dim = 59
+            self.obs_dim = 65
             self.obs_noise = torch.tensor(OBS_NOISE_WIDTHS, dtype=torch.float32, device=dev)
             self.obs_scale = torch.tensor(OBS_SCALES, dtype=torch.float32, device=dev)
 
@@ -125,12 +125,12 @@ class MDP:
         Rt = R.transpose(-1, -2)
         w_b = (Rt @ w.unsqueeze(-1)).squeeze(-1)
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
+        rel = mat_to_6d(Rt @ self.motion.root_R[f])
         if self.obs_kind == "g1d":
             bias = xi[..., 1 : 1 + self.nj]
             upper = q[..., 1:] - self.default_q[1:] - bias[..., 1:]
-            return torch.cat((upper, qd[..., 1:], q[..., :1] - bias[..., :1], qd[..., :1], w_b, g_b, a_prev), -1)
+            return torch.cat((upper, qd[..., 1:], q[..., :1] - bias[..., :1], qd[..., :1], w_b, g_b, a_prev, rel), -1)
         dq0 = xi[..., 1:30]
-        rel = mat_to_6d(Rt @ self.motion.root_R[f])
         return torch.cat((q - self.default_q - dq0, qd, w_b, g_b, a_prev, rel), -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
@@ -178,14 +178,34 @@ class MDP:
 
     def termination(self, S, f) -> torch.Tensor:
         p, R = S[0], S[1]
+        if self.obs_kind == "g1d":
+            # The AGV cannot fall; its height and tilt are fixed, so G1D never terminates in training.
+            return torch.zeros(p.shape[:-1], dtype=torch.bool, device=p.device)
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
         return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
 
+    def eval_failure(self, S, f) -> torch.Tensor:
+        """Eval-only failure. G1 uses its termination; G1D flags any tracked body drifting from the re-anchored reference."""
+        if self.obs_kind != "g1d":
+            return self.termination(S, f)
+        from .g1d import EVAL_FAIL_BODY_POS
+
+        m = self.motion
+        p, R, v, w, q, qd = S
+        bp = self.kin.forward(p, R, v, w, q, qd)[0]
+        rp, rR = m.root_p[f], m.root_R[f]
+        dR = yaw_mat(R @ rR.transpose(-1, -2))
+        anchor = torch.cat((p[..., :2], rp[..., 2:3]), -1)
+        ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
+        return (ref_bp - bp).norm(dim=-1).amax(-1) > EVAL_FAIL_BODY_POS
+
     def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
         """Differentiable termination probability for imagined rollouts."""
         p, R = S[0], S[1]
+        if self.obs_kind == "g1d":
+            return torch.zeros(p.shape[:-1], device=p.device)
         rp, rR = self.motion.root_p[f], self.motion.root_R[f]
         e_z = (rp[..., 2] - p[..., 2]).abs()
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()

@@ -42,7 +42,7 @@ def main():
     kin = G1DKinematics("cpu", XML, STATE_JOINTS, TRACKED_BODIES, COUPLED, COLUMN_LIMIT)
     mdp = MDP(kin, None, torch.tensor(g1d_default_q()), obs_kind="g1d")
     assert (mdp.state_dim, mdp.obs_dim, mdp.nj, mdp.xi_dim, mdp.inv_dim, mdp.goal_frame, mdp.action_dim, mdp.critic_extra, mdp.n_tracked) == (
-        47, 59, 17, 21, 47, 49, 19, 71, 8,
+        47, 65, 17, 21, 47, 49, 19, 71, 8,
     )
     assert list(kin.body_names[:3]) == ["AGV_link", "LZ_mt_Link", "LZ_it_Link"]
     assert abs(float(kin.q_hi[0]) - 0.42) < 1e-6 and abs(float(kin.q_lo[0])) < 1e-8
@@ -88,8 +88,18 @@ def main():
     xi[0, 1] = 0.01
     a = torch.zeros(1, 19)
     S = (p, R, torch.zeros(1, 3), torch.tensor([[0.0, 0.0, 0.3]]), q, torch.zeros(1, 17))
+    with tempfile.TemporaryDirectory() as d:
+        # Reference AGV turned 90 deg left of the robot, so rel is that yaw in 6D.
+        dof = np.zeros((8, 18), np.float32)
+        yaw = float(torch.atan2(R[0, 1, 0], R[0, 0, 0])) + np.pi / 2
+        rot = np.tile([0, 0, np.sin(yaw / 2), np.cos(yaw / 2)], (8, 1)).astype(np.float32)
+        joblib.dump({"fps": 50.0, "root_pos": np.tile(p.numpy(), (8, 1)), "root_rot": rot, "dof_pos": dof}, os.path.join(d, "clip.pkl"))
+        mdp.motion = MotionLib.from_g1d_dir(d, kin, "cpu")
     o = mdp.obs(S, a, xi, torch.zeros(1, dtype=torch.long))
-    assert o.shape == (1, 59)
+    assert o.shape == (1, 65)
+    assert torch.allclose(o[0, 59:], torch.tensor([0.0, -1.0, 1.0, 0.0, 0.0, 0.0]), atol=1e-5), o[0, 59:]
+    assert not bool(mdp.termination(S, torch.zeros(1, dtype=torch.long)).any())
+    assert float(mdp.soft_termination(S, torch.zeros(1, dtype=torch.long)).abs().max()) == 0.0
     assert abs(float(o[0, 32]) - 0.19) < 1e-6  # height minus the column offset
     assert abs(float(o[0, 16 + 16 + 1 + 1 + 2]) - 0.3) < 1e-6  # body wz
     assert torch.allclose(o[0, 16 + 16 + 2 + 3 : 16 + 16 + 2 + 6], torch.tensor([0.0, 0.0, -1.0]))
@@ -97,6 +107,7 @@ def main():
 
     alpha = g1d_action_scale()
     assert len(alpha) == 19 and alpha[16:] == [1.5, 0.6, 0.0765]
+    assert alpha[0] == 0.5  # waist pitch is set by hand, not the 5020 formula
     flat = mdp.unflatten(torch.cat((p, torch.tensor([[1.0, 0, 0, 0]]), torch.zeros(1, 6), q, torch.zeros(1, 17)), -1))
     assert flat[4].shape[-1] == 17
 
@@ -113,7 +124,7 @@ def main():
         assert g.shape == (1, 490)
 
     wm = WorldModel(num_j=17, inv_dim=47, xi_dim=21, action_dim=19)
-    pi = Policy(59, 490, action_dim=19)
+    pi = Policy(65, 490, action_dim=19)
     assert wm.in_dim == 47 + 19 + 21 and wm.out_dim == 46
     assert pi.dec[-1].out_features == 19
     buf = ReplayBuffer(4, 2, "cpu", 47, 19, 21)

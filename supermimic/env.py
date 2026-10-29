@@ -118,6 +118,11 @@ class TrackingSim:
         self.bin_w_avg = torch.full((motion.num_bins,), 1.0 / motion.num_bins, device=dev)
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
+        if kind == "g1d":
+            from .g1d import BASE_CMD_DELAY
+
+            # (vx, wz, vz) commands, oldest first; the plant sees row 0.
+            self.base_queue = torch.zeros(BASE_CMD_DELAY + 1, self.N, 3, device=dev)
         self.reset(torch.arange(self.N, device=dev))
 
     # ------------------------------------------------------------------ g1d plant
@@ -241,9 +246,10 @@ class TrackingSim:
         R = S[1]
         yaw = self._yaw(R)
         c, s = torch.cos(yaw), torch.sin(yaw)
-        vx = self.alpha[16] * a[:, 16]
-        wz = self.alpha[17] * a[:, 17]
-        vz = self.alpha[18] * a[:, 18]
+        # Saturate at VX_MAX / WZ_MAX / VZ_MAX like the real chassis and column; the world model still sees the raw action.
+        new = self.alpha[16:19] * a[:, 16:19].clamp(-1.0, 1.0)
+        self.base_queue = torch.cat((self.base_queue[1:], new.unsqueeze(0)), 0)
+        vx, wz, vz = self.base_queue[0].unbind(-1)
         q = self.robot.data.joint_pos.torch
         vel = torch.zeros_like(q)
         hold = q.clone()
@@ -324,9 +330,10 @@ class TrackingSim:
                 (torch.zeros(n, device=dev), torch.zeros(n, device=dev), torch.empty(n, device=dev).uniform_(-0.2, 0.2)), -1
             )
             R = so3_exp(rv) @ R
-            v = v + torch.stack(
-                (torch.empty(n, device=dev).uniform_(-0.5, 0.5), torch.empty(n, device=dev).uniform_(-0.5, 0.5),
-                 torch.zeros(n, device=dev)), -1)  # fmt: skip
+            # Differential drive: perturb speed along the heading only, never sideways.
+            yaw = self._yaw(R)
+            dv = torch.empty(n, device=dev).uniform_(-0.5, 0.5)
+            v = v + torch.stack((dv * torch.cos(yaw), dv * torch.sin(yaw), torch.zeros(n, device=dev)), -1)
             w = w + torch.stack(
                 (torch.zeros(n, device=dev), torch.zeros(n, device=dev), torch.empty(n, device=dev).uniform_(-0.78, 0.78)), -1
             )
@@ -349,6 +356,7 @@ class TrackingSim:
         q = torch.clamp(q, self.mdp.kin.q_lo, self.mdp.kin.q_hi)
         if self.kind == "g1d":
             self._write_g1d(env_ids, p, R, v, w, q, qd)
+            self.base_queue[:, env_ids] = 0.0
         else:
             quat = mat_to_quat(R)
             pose = torch.cat((p + self.scene.env_origins[env_ids], quat[:, 1:4], quat[:, 0:1]), -1)
@@ -406,7 +414,7 @@ class TrackingSim:
         self.ep_step = ep_step + 1
         self.a_prev = a.clone()
         if self.eval_mode:
-            self.failed_eval |= term & ~self.done_eval
+            self.failed_eval |= self.mdp.eval_failure(S1, f1) & ~self.done_eval
             self.done_eval |= done
             return out
         ids = done.nonzero(as_tuple=False).squeeze(-1)

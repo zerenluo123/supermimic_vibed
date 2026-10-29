@@ -131,11 +131,14 @@ def _actuators() -> dict[str, ImplicitActuatorCfg]:
 
 
 def g1d_action_scale() -> list[float]:
-    """16 position scales from the G1 motor formula, then vx, wz, column speed in SI units."""
-    from .g1d import UPPER_MOTORS, VX_MAX, WZ_MAX, VZ_MAX
+    """16 position scales from the G1 motor formula (waist pitch set by hand), then vx, wz, column speed in SI units."""
+    from .g1d import UPPER_JOINTS, UPPER_MOTORS, VX_MAX, WAIST_PITCH_JOINT, WAIST_PITCH_SCALE, WZ_MAX, VZ_MAX
 
     scales = []
-    for key in UPPER_MOTORS:
+    for name, key in zip(UPPER_JOINTS, UPPER_MOTORS):
+        if name == WAIST_PITCH_JOINT:
+            scales.append(WAIST_PITCH_SCALE)
+            continue
         effort, _, arm = JOINT_MOTORS[key]
         scales.append(0.25 * effort / _kp(arm))
     return scales + [VX_MAX, WZ_MAX, VZ_MAX]
@@ -160,19 +163,31 @@ def g1d_default_q() -> list[float]:
 
 
 def g1d_articulation_cfg() -> ArticulationCfg:
-    """Same USD the chassis test spawns. Upper body uses the G1 implicit PD; base and lift are velocity drives."""
-    from .g1d import UPPER_JOINTS, UPPER_MOTORS
+    """Same USD the chassis test spawns. Upper body uses the G1 implicit PD except the self-locking
+    waist pitch, which takes the Unitree gains; base and lift are velocity drives."""
+    from .g1d import (
+        UPPER_JOINTS,
+        UPPER_MOTORS,
+        WAIST_PITCH_EFFORT,
+        WAIST_PITCH_JOINT,
+        WAIST_PITCH_KD,
+        WAIST_PITCH_KP,
+        WAIST_PITCH_VEL,
+    )
 
     usd = os.path.join(DATA_DIR, "g1d_usd", "g1d", "g1d.usda")
     acts = {}
     for name, key in zip(UPPER_JOINTS, UPPER_MOTORS):
         effort, vel, arm = JOINT_MOTORS[key]
+        kp, kd = _kp(arm), _kd(arm)
+        if name == WAIST_PITCH_JOINT:
+            effort, vel, kp, kd = WAIST_PITCH_EFFORT, WAIST_PITCH_VEL, WAIST_PITCH_KP, WAIST_PITCH_KD
         acts[name] = ImplicitActuatorCfg(
             joint_names_expr=[name],
             effort_limit_sim=effort,
             velocity_limit_sim=vel,
-            stiffness=_kp(arm),
-            damping=_kd(arm),
+            stiffness=kp,
+            damping=kd,
             armature=arm,
         )
     acts["chassis"] = ImplicitActuatorCfg(

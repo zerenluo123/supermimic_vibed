@@ -59,9 +59,23 @@ COLUMN_LIMIT = (0.0, 0.42)
 VX_MAX, WZ_MAX, VZ_MAX = 1.5, 0.6, 0.0765
 TAU = 0.15
 BASE_JOINTS = ("base_x_joint:0", "base_x_joint:1", "base_x_joint:2")
+# Control steps between a chassis/column command and the plant seeing it. 0 until measured on the robot.
+BASE_CMD_DELAY = 0
 
-# Observation: 16 + 16 + 1 + 1 + 3 + 3 + 19. Velocity scale matches G1 (0.1) on the arm
-# joints; column speed stays in m/s because its full scale is 0.0765.
+# Waist pitch is a self-locking motor on its own topic (rt/waistpitchcmd). Gains are the Unitree
+# example values. Effort and speed limits are placeholders until measured: effort is ~2.7x the
+# worst gravity torque (44.5 Nm at 90 deg), speed covers p99.9 of the retarget data.
+WAIST_PITCH_JOINT = "Yaw_Joint"
+WAIST_PITCH_KP, WAIST_PITCH_KD = 500.0, 12.0
+WAIST_PITCH_EFFORT, WAIST_PITCH_VEL = 120.0, 3.5
+WAIST_PITCH_SCALE = 0.5
+
+# Eval counts a clip as failed once any tracked body is this far from the re-anchored reference.
+EVAL_FAIL_BODY_POS = 0.5
+
+# Observation: 16 + 16 + 1 + 1 + 3 + 3 + 19 + 6. Velocity scale matches G1 (0.1) on the arm
+# joints; column speed stays in m/s because its full scale is 0.0765. The last 6 are the
+# reference-relative AGV orientation, as in G1.
 OBS_NOISE_WIDTHS = (
     [0.01] * 16
     + [0.5] * 16
@@ -69,6 +83,7 @@ OBS_NOISE_WIDTHS = (
     + [0.2] * 3
     + [0.05] * 3
     + [0.0] * 19
+    + [0.05] * 6
 )
 OBS_SCALES = (
     [1.0] * 16
@@ -77,4 +92,5 @@ OBS_SCALES = (
     + [0.25] * 3
     + [1.0] * 3
     + [1.0] * 19
+    + [1.0] * 6
 )
