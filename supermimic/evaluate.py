@@ -116,7 +116,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
-    env = TrackingSim(sim_cfg, C, motion, mdp, eval_mode=True, kind=args.robot)
+    env = TrackingSim(sim_cfg, C, motion, mdp, eval_mode=True, kind=args.robot, reset_a_prev=_meta.get("reset_a_prev", "hold"))
     if args.ckpt:
         ck = torch.load(args.ckpt, map_location=dev)
         res = evaluate(env, ck, args.record)

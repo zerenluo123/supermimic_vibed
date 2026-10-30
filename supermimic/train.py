@@ -42,6 +42,7 @@ parser.add_argument("--robot", choices=("g1", "g1d"), default="g1")
 parser.add_argument("--motion_dir", type=str, default=os.path.join(REPO, "data", "lafan1_g1"))
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--reset_a_prev", choices=("hold", "zero"), default="hold", help="G1D: a_prev after a reset")
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 add_launcher_args(parser)
@@ -273,7 +274,7 @@ def policy_update():
 # ------------------------------------------------------------------------------------------------
 sim_cfg = make_sim(dev, args)
 with launch_simulation(sim_cfg, args):
-    env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma, kind=args.robot)
+    env = TrackingSim(sim_cfg, args.num_envs, motion, mdp, gamma=args.gamma, kind=args.robot, reset_a_prev=args.reset_a_prev)
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, mdp.state_dim, mdp.action_dim, mdp.xi_dim)
     obs_hist = torch.zeros(args.num_envs, Hh, mdp.obs_dim, device=dev)
 

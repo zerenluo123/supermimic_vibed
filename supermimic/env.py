@@ -53,9 +53,13 @@ class TrackingSim:
     """
 
     def __init__(self, sim_cfg, num_envs: int, motion: MotionLib, mdp: MDP, gamma: float = 0.99, eval_mode: bool = False,
-                 max_episode_steps: int = 500, reset_noise: bool = True, kind: str = "g1"):
+                 max_episode_steps: int = 500, reset_noise: bool = True, kind: str = "g1", reset_a_prev: str = "hold"):
         self.device = sim_cfg.device
         self.kind = kind
+        # G1D only: a_prev after a reset is "hold" (the action that holds the reset state) or "zero" (the nominal pose
+        # and a standing chassis, as G1). Both agree when the robot starts at the nominal pose, as on deployment.
+        assert reset_a_prev in ("hold", "zero"), reset_a_prev
+        self.reset_a_prev = reset_a_prev
         self.sim = SimulationContext(sim_cfg)
         scene_cfg = TrackingSceneCfg(num_envs=num_envs, env_spacing=0.0, replicate_physics=True)
         if kind == "g1d":
@@ -384,9 +388,9 @@ class TrackingSim:
             nj = self.mdp.nj
             self.xi[env_ids, 1 : 1 + nj] = torch.empty(n, nj, device=dev).uniform_(-0.01, 0.01)
         if self.kind == "g1d":
-            # The previous action is the one that holds the reset state, so the first step's action-rate
+            # "hold": the previous action is the one that holds the reset state, so the first step's action-rate
             # penalty and a_prev in the observation see a real change of command, not a jump from 0.
-            hold = self._hold_action_g1d(env_ids, R, v, w, q, qd)
+            hold = self._hold_action_g1d(env_ids, R, v, w, q, qd) if self.reset_a_prev == "hold" else torch.zeros_like(self.a_prev[env_ids])
             self.a_prev[env_ids] = hold
             self.base_queue[:, env_ids] = (self.alpha[16:19] * hold[:, 16:19]).unsqueeze(0)
         self.scene.reset(env_ids)
