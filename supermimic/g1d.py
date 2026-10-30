@@ -56,6 +56,7 @@ TRACKED_BODIES = [
 # Each slide joint carries half of the column coordinate.
 COUPLED = {"LZ_mt_Joint": (0, 0.5), "LZ_it_Joint": (0, 0.5)}
 COLUMN_LIMIT = (0.0, 0.42)
+# Chassis and column commands are MAX * tanh(a) (mdp.effective_action), in sim and on the robot alike.
 VX_MAX, WZ_MAX, VZ_MAX = 1.5, 0.6, 0.0765
 TAU = 0.15
 BASE_JOINTS = ("base_x_joint:0", "base_x_joint:1", "base_x_joint:2")

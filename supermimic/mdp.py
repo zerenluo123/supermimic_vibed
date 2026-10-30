@@ -118,6 +118,15 @@ class MDP:
         nj = self.nj
         return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., 1 : 1 + nj] / 0.01, xi[..., 1 + nj :] / 0.05), -1)
 
+    def effective_action(self, a: torch.Tensor) -> torch.Tensor:
+        """The action the plant acts on. G1D's chassis and column speeds saturate softly (tanh, times VX_MAX / WZ_MAX /
+        VZ_MAX in the env), the same way in the simulator and in imagined rollouts: with a hard clamp in the env only,
+        the world model extrapolated past the saturation and the policy drove the column action to ~40, pinning the
+        column at a stroke end. The world model, the reward and a_prev all see this action. G1 is unchanged."""
+        if self.obs_kind != "g1d":
+            return a
+        return torch.cat((a[..., :16], torch.tanh(a[..., 16:19])), -1)
+
     # ---------------- observation ----------------
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
         """Noise-free proprioceptive observation (+ reference-relative root orientation)."""

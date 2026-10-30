@@ -108,6 +108,11 @@ def main():
     alpha = g1d_action_scale()
     assert len(alpha) == 19 and alpha[16:] == [1.5, 0.6, 0.0765]
     assert alpha[0] == 0.5  # waist pitch is set by hand, not the 5020 formula
+    a = torch.tensor([[3.0] * 16 + [5.0, -0.5, 2.5]])
+    eff = mdp.effective_action(a)
+    assert torch.equal(eff[0, :16], a[0, :16]) and float(eff[0, 16:].abs().max()) < 1.0  # chassis / column saturate softly
+    assert abs(float(eff[0, 17]) - float(torch.tanh(torch.tensor(-0.5)))) < 1e-6
+    assert torch.equal(g1.effective_action(torch.full((1, 29), 5.0)), torch.full((1, 29), 5.0))  # G1 untouched
     flat = mdp.unflatten(torch.cat((p, torch.tensor([[1.0, 0, 0, 0]]), torch.zeros(1, 6), q, torch.zeros(1, 17)), -1))
     assert flat[4].shape[-1] == 17
 

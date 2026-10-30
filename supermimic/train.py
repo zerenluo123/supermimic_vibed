@@ -123,7 +123,7 @@ def _wm_err(S_hat, s1, mask):
 
 
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
-    a = pi(o_hist, g)
+    a = mdp.effective_action(pi(o_hist, g))  # the same saturation as the env applies
     S1 = wm.step(S, a, xi_n)
     f1 = f + 1
     o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))

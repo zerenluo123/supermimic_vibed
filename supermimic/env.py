@@ -242,7 +242,8 @@ class TrackingSim:
         cmd.set_velocity_index(value=vel, env_ids=env_ids)
 
     def _hold_action_g1d(self, env_ids, R, v, w, q, qd):
-        """Action whose targets are the reset state: upper joints at q, chassis and column at their reset speeds."""
+        """Effective action whose targets are the reset state: upper joints at q, chassis and column at their reset
+        speeds (clamped to the saturation)."""
         bias = self.xi[env_ids, 2 : 2 + 16]
         upper = (q[:, 1:] - self.mdp.default_q[1:] - bias) / self.alpha[:16]
         yaw = self._yaw(R)
@@ -255,8 +256,8 @@ class TrackingSim:
         R = S[1]
         yaw = self._yaw(R)
         c, s = torch.cos(yaw), torch.sin(yaw)
-        # Saturate at VX_MAX / WZ_MAX / VZ_MAX like the real chassis and column; the world model still sees the raw action.
-        new = self.alpha[16:19] * a[:, 16:19].clamp(-1.0, 1.0)
+        # a is already the effective action (mdp.effective_action): chassis and column entries lie in (-1, 1).
+        new = self.alpha[16:19] * a[:, 16:19]
         self.base_queue = torch.cat((self.base_queue[1:], new.unsqueeze(0)), 0)
         vx, wz, vz = self.base_queue[0].unbind(-1)
         q = self.robot.data.joint_pos.torch
@@ -397,6 +398,7 @@ class TrackingSim:
 
     # ------------------------------------------------------------------ step
     def step(self, a: torch.Tensor) -> dict:
+        a = self.mdp.effective_action(a)
         S = self.state()
         f = self.f.clone()
         xi = self.xi.clone()
